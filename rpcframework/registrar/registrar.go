@@ -1,3 +1,21 @@
+/*
+ *
+ * Copyright 2014 gRPC authors.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
 package registrar
 
 import (
@@ -15,8 +33,52 @@ import (
 
 var logger = grpclog.Component("registrar")
 
+// A ServerOption sets options such as credentials, codec and keepalive parameters, etc.
+type ServerOption interface {
+	apply(*serverOptions)
+}
+
+// funcServerOption wraps a function that modifies serverOptions into an
+// implementation of the ServerOption interface.
+type funcServerOption struct {
+	f func(*serverOptions)
+}
+
+func (fdo *funcServerOption) apply(do *serverOptions) {
+	fdo.f(do)
+}
+
+func newFuncServerOption(f func(*serverOptions)) *funcServerOption {
+	return &funcServerOption{
+		f: f,
+	}
+}
+
+// UnaryInterceptor returns a ServerOption that sets the UnaryServerInterceptor for the
+// server. Only one unary interceptor can be installed. The construction of multiple
+// interceptors (e.g., chaining) can be implemented at the caller.
+func UnaryInterceptor(i grpc.UnaryServerInterceptor) ServerOption {
+	return newFuncServerOption(func(o *serverOptions) {
+		if o.unaryInt != nil {
+			panic("The unary server interceptor was already set and may not be reset.")
+		}
+		o.unaryInt = i
+	})
+}
+
+// ChainUnaryInterceptor returns a ServerOption that specifies the chained interceptor
+// for unary RPCs. The first interceptor will be the outer most,
+// while the last interceptor will be the inner most wrapper around the real call.
+// All unary interceptors added by this method will be chained.
+func ChainUnaryInterceptor(interceptors ...grpc.UnaryServerInterceptor) ServerOption {
+	return newFuncServerOption(func(o *serverOptions) {
+		o.chainUnaryInts = append(o.chainUnaryInts, interceptors...)
+	})
+}
+
 // GRPCServiceRegistrar 实现grpc.ServiceRegistrar接口
 type GRPCServiceRegistrar struct {
+	opts     serverOptions
 	mu       sync.Mutex              // guards following
 	services map[string]*serviceInfo // service name -> service info
 }
@@ -31,10 +93,17 @@ type serviceInfo struct {
 }
 
 // NewGRPCServiceRegistrar 创建一个新的动态服务注册器
-func NewGRPCServiceRegistrar() *GRPCServiceRegistrar {
-	return &GRPCServiceRegistrar{
+func NewGRPCServiceRegistrar(opt ...ServerOption) *GRPCServiceRegistrar {
+	opts := serverOptions{}
+	for _, o := range opt {
+		o.apply(&opts)
+	}
+	s := &GRPCServiceRegistrar{
+		opts:     opts,
 		services: make(map[string]*serviceInfo),
 	}
+	chainUnaryServerInterceptors(s)
+	return s
 }
 
 // 实现grpc.ServiceRegistrar接口
@@ -126,4 +195,45 @@ func (d *GRPCServiceRegistrar) GetServiceMethods(serviceName string) ([]string, 
 		methods = append(methods, name)
 	}
 	return methods, nil
+}
+
+type serverOptions struct {
+	unaryInt       grpc.UnaryServerInterceptor
+	chainUnaryInts []grpc.UnaryServerInterceptor
+}
+
+// chainUnaryServerInterceptors chains all unary server interceptors into one.
+func chainUnaryServerInterceptors(s *GRPCServiceRegistrar) {
+	// Prepend opts.unaryInt to the chaining interceptors if it exists, since unaryInt will
+	// be executed before any other chained interceptors.
+	interceptors := s.opts.chainUnaryInts
+	if s.opts.unaryInt != nil {
+		interceptors = append([]grpc.UnaryServerInterceptor{s.opts.unaryInt}, s.opts.chainUnaryInts...)
+	}
+
+	var chainedInt grpc.UnaryServerInterceptor
+	if len(interceptors) == 0 {
+		chainedInt = nil
+	} else if len(interceptors) == 1 {
+		chainedInt = interceptors[0]
+	} else {
+		chainedInt = chainUnaryInterceptors(interceptors)
+	}
+
+	s.opts.unaryInt = chainedInt
+}
+
+func chainUnaryInterceptors(interceptors []grpc.UnaryServerInterceptor) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		return interceptors[0](ctx, req, info, getChainUnaryHandler(interceptors, 0, info, handler))
+	}
+}
+
+func getChainUnaryHandler(interceptors []grpc.UnaryServerInterceptor, curr int, info *grpc.UnaryServerInfo, finalHandler grpc.UnaryHandler) grpc.UnaryHandler {
+	if curr == len(interceptors)-1 {
+		return finalHandler
+	}
+	return func(ctx context.Context, req any) (any, error) {
+		return interceptors[curr+1](ctx, req, info, getChainUnaryHandler(interceptors, curr+1, info, finalHandler))
+	}
 }
